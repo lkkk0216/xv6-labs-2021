@@ -119,6 +119,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -163,6 +164,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  memset(p->vmas, 0, sizeof(p->vmas));
   p->state = UNUSED;
 }
 
@@ -289,6 +291,13 @@ fork(void)
   }
   np->sz = p->sz;
 
+  if(vmafork(p, np) < 0){
+    vmafree(np);
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -343,6 +352,9 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // mmap也持有文件引用，并且页不在p->sz范围内
+  vmafree(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

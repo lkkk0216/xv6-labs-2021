@@ -5,6 +5,11 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "proc.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -431,4 +436,143 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+static struct vma*
+findvma(struct proc *p, uint64 addr)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(v->used && addr >= v->addr && addr < v->addr + v->len)
+      return v;
+  }
+  return 0;
+}
+
+int
+vmafault(struct proc *p, uint64 addr, int cause)
+{
+  struct vma *v = findvma(p, addr);
+  if(v == 0)
+    return -1;
+  if(cause == 12 && (v->prot & PROT_EXEC) == 0)
+    return -1;
+  if(cause == 13 && (v->prot & PROT_READ) == 0)
+    return -1;
+  if(cause == 15 && (v->prot & PROT_WRITE) == 0)
+    return -1;
+
+  uint64 va = PGROUNDDOWN(addr);
+  pte_t *oldpte = walk(p->pagetable, va, 0);
+  if(oldpte && (*oldpte & PTE_V))
+    return -1;
+
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  uint64 off = v->offset + va - v->addr;
+  uint n = PGSIZE;
+  if(off + n > v->offset + v->len)
+    n = v->offset + v->len - off;
+  ilock(v->file->ip);
+  int r = readi(v->file->ip, 0, (uint64)mem, off, n);
+  iunlock(v->file->ip);
+  if(r < 0){
+    kfree(mem);
+    return -1;
+  }
+
+  int perm = PTE_U;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_R | PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0){
+    kfree(mem);
+    return -1;
+  }
+  return 0;
+}
+
+int
+vmaunmap(struct proc *p, uint64 addr, uint64 len)
+{
+  struct vma *v = findvma(p, addr);
+  if(v == 0 || len == 0 || addr + len > v->addr + v->len)
+    return -1;
+  if(addr != v->addr && addr + len != v->addr + v->len)
+    return -1;
+
+  uint64 start = PGROUNDDOWN(addr);
+  uint64 end = PGROUNDUP(addr + len);
+  for(uint64 va = start; va < end; va += PGSIZE){
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      continue;
+    if(v->flags & MAP_SHARED){
+      uint n = PGSIZE;
+      if(va + n > v->addr + v->len)
+        n = v->addr + v->len - va;
+      begin_op();
+      ilock(v->file->ip);
+      writei(v->file->ip, 0, PTE2PA(*pte),
+             v->offset + va - v->addr, n);
+      iunlock(v->file->ip);
+      end_op();
+    }
+    uvmunmap(p->pagetable, va, 1, 1);
+  }
+
+  if(addr == v->addr){
+    v->addr += len;
+    v->offset += len;
+  }
+  v->len -= len;
+  if(v->len == 0){
+    fileclose(v->file);
+    memset(v, 0, sizeof(*v));
+  }
+  return 0;
+}
+
+void
+vmafree(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used)
+      vmaunmap(p, p->vmas[i].addr, p->vmas[i].len);
+  }
+}
+
+int
+vmafork(struct proc *p, struct proc *np)
+{
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0)
+      continue;
+    np->vmas[i] = p->vmas[i];
+    filedup(np->vmas[i].file);
+
+    struct vma *v = &p->vmas[i];
+    for(uint64 va = PGROUNDDOWN(v->addr);
+        va < PGROUNDUP(v->addr + v->len); va += PGSIZE){
+      pte_t *pte = walk(p->pagetable, va, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+      char *mem = kalloc();
+      if(mem == 0)
+        return -1;
+      memmove(mem, (char*)PTE2PA(*pte), PGSIZE);
+      uint flags = PTE_FLAGS(*pte);
+      if(mappages(np->pagetable, va, PGSIZE, (uint64)mem, flags) < 0){
+        kfree(mem);
+        return -1;
+      }
+    }
+  }
+  return 0;
 }
