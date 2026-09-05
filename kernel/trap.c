@@ -65,6 +65,8 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 15 && cowfault(p->pagetable, r_stval()) == 0){
+    // COW页第一次写入时换成当前进程自己的可写页
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -217,4 +219,3 @@ devintr()
     return 0;
   }
 }
-
