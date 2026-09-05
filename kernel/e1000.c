@@ -95,26 +95,56 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(struct mbuf *m)
 {
-  //
-  // Your code here.
-  //
-  // the mbuf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after sending.
-  //
-  
+  acquire(&e1000_lock);
+  uint32 i = regs[E1000_TDT];
+
+  // DD为0说明网卡还没有用完这个描述符
+  if((tx_ring[i].status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+  if(tx_mbufs[i])
+    mbuffree(tx_mbufs[i]);
+
+  tx_ring[i].addr = (uint64)m->head;
+  tx_ring[i].length = m->len;
+  tx_ring[i].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[i].status = 0;
+  tx_mbufs[i] = m;
+  __sync_synchronize();
+  regs[E1000_TDT] = (i + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+  for(;;){
+    acquire(&e1000_lock);
+    uint32 i = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    if((rx_ring[i].status & E1000_RXD_STAT_DD) == 0){
+      release(&e1000_lock);
+      break;
+    }
+
+    struct mbuf *new = mbufalloc(0);
+    if(new == 0){
+      release(&e1000_lock);
+      break;
+    }
+    struct mbuf *m = rx_mbufs[i];
+    m->len = rx_ring[i].length;
+    rx_mbufs[i] = new;
+    rx_ring[i].addr = (uint64)new->head;
+    rx_ring[i].status = 0;
+    __sync_synchronize();
+    regs[E1000_RDT] = i;
+    release(&e1000_lock);
+
+    // net_rx可能马上发送ARP响应，不能拿着网卡锁调用它
+    net_rx(m);
+  }
 }
 
 void
